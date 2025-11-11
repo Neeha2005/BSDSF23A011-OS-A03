@@ -1,0 +1,14 @@
+bin
+build
+c
+cd
+exit
+help
+include
+jobs
+Makefile
+output.txt
+out.txt
+pwd
+README.md
+src

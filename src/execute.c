@@ -1,110 +1,123 @@
 #include "../include/shell.h"
-#include <fcntl.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <errno.h>
 
-int execute_command(char **args) {
-    if (!args[0]) return 1;
+extern pid_t bg_jobs[MAX_BG_JOBS];
+extern int bg_count;
 
-    // Check for built-ins first
-    if (strcmp(args[0], "cd") == 0) {
-        change_directory(args);
+/* Helper to run a pipeline of command_t nodes (head). Supports multiple stages.
+   Returns 1 on success, 0 on failure (doesn't abort shell).
+*/
+int execute_pipeline(command_t *head) {
+    if (!head || !head->args[0]) return 1;
+
+    // If pipeline has single stage and is a builtin, handle here
+    if (!head->next) {
+        char *cmd0 = head->args[0];
+        if (strcmp(cmd0, "cd") == 0) { change_directory(head->args); return 1; }
+        if (strcmp(cmd0, "help") == 0) { print_help(); return 1; }
+        if (strcmp(cmd0, "history") == 0) { show_history(); return 1; }
+        if (strcmp(cmd0, "jobs") == 0) { print_jobs(); return 1; }
+        if (strcmp(cmd0, "exit") == 0) { exit(0); }
+    }
+
+    // Count stages
+    int stages = 0;
+    for (command_t *c = head; c; c = c->next) stages++;
+
+    // Create pipes: for N stages we need N-1 pipes
+    int (*pipes)[2] = NULL;
+    if (stages > 1) {
+        pipes = malloc(sizeof(int[2]) * (stages - 1));
+        for (int i = 0; i < stages - 1; ++i) {
+            if (pipe(pipes[i]) < 0) { perror("pipe"); free(pipes); return 0; }
+        }
+    }
+
+    pid_t *pids = calloc(stages, sizeof(pid_t));
+    int idx = 0;
+    command_t *cur = head;
+    while (cur) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            // cleanup: close pipes
+            for (int i = 0; i < stages - 1; ++i) { close(pipes[i][0]); close(pipes[i][1]); }
+            free(pipes); free(pids);
+            return 0;
+        } else if (pid == 0) {
+            // Child: set up stdin/stdout redirection & pipes
+            // If first stage and has input_file
+            if (cur->input_file) {
+                int fd = open(cur->input_file, O_RDONLY);
+                if (fd < 0) { perror("open input"); exit(1); }
+                dup2(fd, STDIN_FILENO); close(fd);
+            }
+            // If last stage and has output_file
+            if (!cur->next && cur->output_file) {
+                int fd = open(cur->output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fd < 0) { perror("open output"); exit(1); }
+                dup2(fd, STDOUT_FILENO); close(fd);
+            }
+
+            // If pipeline, connect pipes
+            if (stages > 1) {
+                if (idx == 0) {
+                    // first stage: stdout -> pipes[0][1]
+                    dup2(pipes[0][1], STDOUT_FILENO);
+                } else if (!cur->next) {
+                    // last stage: stdin <- pipes[idx-1][0]
+                    dup2(pipes[idx - 1][0], STDIN_FILENO);
+                } else {
+                    // middle stage: stdin <- pipes[idx-1][0], stdout -> pipes[idx][1]
+                    dup2(pipes[idx - 1][0], STDIN_FILENO);
+                    dup2(pipes[idx][1], STDOUT_FILENO);
+                }
+                // Close all pipe fds in child
+                for (int j = 0; j < stages - 1; ++j) {
+                    close(pipes[j][0]); close(pipes[j][1]);
+                }
+            }
+
+            // Exec
+            execvp(cur->args[0], cur->args);
+            // If exec fails:
+            perror("myshell");
+            exit(127);
+        } else {
+            // parent
+            pids[idx++] = pid;
+            cur = cur->next;
+        }
+    }
+
+    // Parent: close all pipe ends
+    if (stages > 1) {
+        for (int i = 0; i < stages - 1; ++i) {
+            close(pipes[i][0]); close(pipes[i][1]);
+        }
+    }
+
+    // If background flag set on head (we treat it as pipeline-level background),
+    // don't wait and add all child pids to bg_jobs
+    int background = head->background;
+    if (background) {
+        for (int i = 0; i < stages; ++i) {
+            if (bg_count < MAX_BG_JOBS) bg_jobs[bg_count++] = pids[i];
+        }
+        printf("[BG] PIDs:");
+        for (int i = 0; i < stages; ++i) printf(" %d", pids[i]);
+        printf("\n");
+        free(pipes); free(pids);
         return 1;
     }
-    if (strcmp(args[0], "help") == 0) {
-        print_help();
-        return 1;
-    }
-    if (strcmp(args[0], "exit") == 0) {
-        printf("Exiting MyShell...\n");
-        exit(0);
-    }
-    if (strcmp(args[0], "history") == 0) {
-        print_history();
-        return 1;
+
+    // Otherwise wait for all children
+    for (int i = 0; i < stages; ++i) {
+        int status;
+        waitpid(pids[i], &status, 0);
     }
 
-    // --- Handle pipes ---
-    int pipe_index = -1;
-    for (int i = 0; args[i]; i++) {
-        if (strcmp(args[i], "|") == 0) {
-            pipe_index = i;
-            break;
-        }
-    }
-
-    if (pipe_index != -1) {
-        args[pipe_index] = NULL; // Split args for left command
-
-        int fd[2];
-        if (pipe(fd) == -1) {
-            perror("myshell: pipe failed");
-            return 1;
-        }
-
-        pid_t pid1 = fork();
-        if (pid1 == 0) {
-            // Left child (writer)
-            dup2(fd[1], STDOUT_FILENO);
-            close(fd[0]);
-            close(fd[1]);
-            if (execvp(args[0], args) == -1) perror("myshell");
-            exit(EXIT_FAILURE);
-        }
-
-        pid_t pid2 = fork();
-        if (pid2 == 0) {
-            // Right child (reader)
-            dup2(fd[0], STDIN_FILENO);
-            close(fd[0]);
-            close(fd[1]);
-            char **right_args = &args[pipe_index + 1];
-            if (execvp(right_args[0], right_args) == -1) perror("myshell");
-            exit(EXIT_FAILURE);
-        }
-
-        // Parent closes pipe ends
-        close(fd[0]);
-        close(fd[1]);
-        waitpid(pid1, NULL, 0);
-        waitpid(pid2, NULL, 0);
-        return 1;
-    }
-
-    // --- Handle I/O redirection ---
-    int in_fd = -1, out_fd = -1;
-    for (int i = 0; args[i]; i++) {
-        if (strcmp(args[i], "<") == 0) {
-            args[i] = NULL;
-            in_fd = open(args[i + 1], O_RDONLY);
-            if (in_fd < 0) perror("myshell");
-        }
-        if (strcmp(args[i], ">") == 0) {
-            args[i] = NULL;
-            out_fd = open(args[i + 1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (out_fd < 0) perror("myshell");
-        }
-    }
-
-    // --- Execute command ---
-    pid_t pid = fork();
-    if (pid == 0) {
-        if (in_fd != -1) {
-            dup2(in_fd, STDIN_FILENO);
-            close(in_fd);
-        }
-        if (out_fd != -1) {
-            dup2(out_fd, STDOUT_FILENO);
-            close(out_fd);
-        }
-        if (execvp(args[0], args) == -1) perror("myshell");
-        exit(EXIT_FAILURE);
-    } else if (pid < 0) {
-        perror("myshell");
-    } else {
-        waitpid(pid, NULL, 0);
-    }
-
+    free(pipes);
+    free(pids);
     return 1;
 }
