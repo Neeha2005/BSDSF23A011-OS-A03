@@ -1,6 +1,6 @@
 #ifndef SHELL_H
 #define SHELL_H
-
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +12,7 @@
 #define MAX_TOKENS 64
 #define MAX_INPUT_SIZE 1024
 #define HISTORY_SIZE 20
+void show_history();
 
 // Shell functions
 void shell_loop();
