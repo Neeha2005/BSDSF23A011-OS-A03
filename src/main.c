@@ -1,7 +1,8 @@
 #include "../include/shell.h"
+#include <stdio.h>
 
 int main() {
-    printf("Welcome to MyShell (Feature 2 - Built-in Commands)\n");
+    printf("start working");
     shell_loop();
     return 0;
 }
